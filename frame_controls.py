@@ -1,10 +1,12 @@
 #!/usr/local/bin/python
 # -*- coding: utf-8 -*-
 
-import RPi.GPIO as GPIO # Import Raspberry Pi GPIO library
+from gpiozero import Button
+
 import os
 import time
-import Adafruit_DHT
+import adafruit_dht
+import board
 import paho.mqtt.client as mqtt
 import pprint
 
@@ -12,45 +14,49 @@ from configparser import ConfigParser
 import json
 from threading import Thread
 
+picframe_paused = "OFF"
+
 # Fuer jeden Button einen Callback
 
 def button_callback_1(channel):
-    __button_pressed('Button1');
-	
+	if picframe_paused == 'OFF':
+		__button_pressed("homeassistant/switch/picframe_paused/set","ON");
+	else:
+		__button_pressed("homeassistant/switch/picframe_paused/set","OFF");
+
+def shutdownpin_pressed(channel):
+	print("UPS signal")
+
+def button_callback_1_held(channel):
+	print("Shutdown initiated")
+	os.system("sudo shutdown -h now")
+
 def button_callback_2(channel):
-    __button_pressed('Button2');
-	
+    __button_pressed("homeassistant/button/picframe_back/set","ON");
+
 def button_callback_3(channel):
-    __button_pressed('Button3');
-	
-	
-# Hier werden die Buttons eingerichtet
-GPIO.setwarnings(False) # Ignore warning for now
-GPIO.setmode(GPIO.BOARD) # Use physical pin numbering
+    __button_pressed("homeassistant/button/picframe_next/set","ON");
 
-GPIO.setup(29, GPIO.IN, pull_up_down=GPIO.PUD_UP) # Set pin 29 to be an input pin and set initial value to be pulled low (off)
-GPIO.add_event_detect(29,GPIO.FALLING,callback=button_callback_1) # Setup event on pin 29 rising edge
+button1 = Button('BOARD29', hold_time=5)
+button1.when_pressed = button_callback_1
+button1.when_held = button_callback_1_held
 
-GPIO.setup(31, GPIO.IN, pull_up_down=GPIO.PUD_UP) # Set pin 29 to be an input pin and set initial value to be pulled low (off)
-GPIO.add_event_detect(31,GPIO.FALLING,callback=button_callback_2) # Setup event on pin 29 rising edge
+button2 = Button('BOARD31')
+button2.when_pressed = button_callback_2
 
-GPIO.setup(32, GPIO.IN, pull_up_down=GPIO.PUD_UP) # Set pin 29 to be an input pin and set initial value to be pulled low (off)
-GPIO.add_event_detect(32,GPIO.FALLING,callback=button_callback_3) # Setup event on pin 29 rising edge
+button3 = Button('BOARD36')
+button3.when_pressed = button_callback_3
+
+shutdownpin = Button('BOARD11', pull_up=False, hold_time=2) 
+shutdownpin.when_held = button_callback_1_held
+shutdownpin.when_pressed = shutdownpin_pressed
+
+path_current_directory = os.path.dirname(__file__)
+path_config_file = os.path.join(path_current_directory, 'config.ini')
 
 # Jetzt wird der DHT22 eingerichtet
 config = ConfigParser(delimiters=('=', ))
-config.read('config.ini')
-
-sensor_type = config['sensor'].get('type', 'dht22').lower()
-
-if sensor_type == 'dht22':
-    sensor = Adafruit_DHT.DHT22
-elif sensor_type == 'dht11':
-    sensor = Adafruit_DHT.dht11
-elif sensor_type == 'am2302':
-    sensor = Adafruit_DHT.AM2302
-else:
-    raise Exception('Supported sensor types: DHT22, DHT11, AM2302')
+config.read(path_config_file)
 
 pin = config['sensor'].get('pin', 10)
 device_id = config['mqtt'].get('device_id', 'picframe_controls')
@@ -59,85 +65,71 @@ sleep_time = config['sensor'].getint('interval', 60)
 available_topic = "homeassistant/switch/picframe/available"
 
 sensor_topic_head = "homeassistant/sensor/" + device_id
-button1_state = "unpressed"
-button2_state = "unpressed"
-button3_state = "unpressed"
 
-last_temp = 0
-last_hum = 0
+
 
 # The callback for when the client receives a CONNACK response from the server.
 def on_connect(client, userdata, flags, rc):
-    print("Connected with result code {}".format(rc))
-    __setup_sensor(client, "Humidity", "%", 'mdi:percent', available_topic, 'diagnostic')
-    __setup_sensor(client, "Temperature", "°C", 'mdi:temperature-celsius', available_topic, 'diagnostic')
-	
-    __setup_sensor(client, "Button1", "Pressed", 'mdi:Switch', available_topic, 'diagnostic')
-    __setup_sensor(client, "Button2", "Pressed", 'mdi:Switch', available_topic, 'diagnostic')
-    __setup_sensor(client, "Button3", "Pressed", 'mdi:Switch', available_topic, 'diagnostic')
-	
+	print("Connected with result code {}".format(rc))
+	__setup_sensor(client, "Humidity", "%", 'mdi:percent', available_topic, 'diagnostic')
+	__setup_sensor(client, "Temperature", "°C", 'mdi:temperature-celsius', available_topic, 'diagnostic')
+
+	client.subscribe("homeassistant/switch/picframe_paused/state", qos=0)
+
+def on_message(client, userdata, msg):  # The callback for when a PUBLISH message is received from the server. 
+	global picframe_paused
+	message = msg.payload.decode("utf-8")
+	print("Message received-> " + msg.topic + " :" + message)  # Print a received msg
+
+	if msg.topic == "homeassistant/switch/picframe_paused/state":
+		picframe_paused = message
+
 def __setup_sensor(client, topic, unit, icon, available_topic, entity_category=None): 
-    config_topic = sensor_topic_head + "_" + topic + "/config"
-    name = device_id + "_" + topic
-    dict = {"name": name,
-            "icon": icon,
+	config_topic = sensor_topic_head + "_" + topic + "/config"
+	name = device_id + "_" + topic
+	dict = {"name": name,
+			"icon": icon,
 			"unit_of_measurement": unit, 
-            "value_template": "{{ value_json." + topic + "}}",
-            "avty_t": available_topic,
-            "uniq_id": name,
-            "dev":{"ids":[device_id]}}
-			
-    dict["state_topic"] = sensor_topic_head + "/state"
-	
-    if entity_category:
-        dict["entity_category"] = entity_category
-								 
-    config_payload = json.dumps(dict)
-    client.publish(config_topic, config_payload, qos=0, retain=True)
-    client.subscribe(device_id + "/" + topic, qos=0)
-	
-def __button_pressed(topic):
-    data = { topic: 'Pressed'}
-    client.publish(sensor_topic_head + "/state", json.dumps(data))
-    time.sleep(0.5)
-	
-    __send_state()
-    print(topic + ' pressed. Published. Sleeping ... ')
-	
-def __send_state():
-    humidity, temperature = Adafruit_DHT.read_retry(sensor, pin)
+			"value_template": "{{ value_json." + topic + "}}",
+			"avty_t": available_topic,
+			"uniq_id": name,
+			"dev":{"ids":[device_id]}}
 
-    if humidity is not None and temperature is not None:
-        temp_val = round(temperature, decim_digits)
-        hum_val = round(humidity, decim_digits)
-        last_temp = temp_val
-        last_hum = hum_val
-    else:
-        temp_val = last_temp
-        hum_val = last_hum
+	dict["state_topic"] = sensor_topic_head + "/state"
 
-    data = {'Temperature': temp_val,
-            'Humidity': hum_val,
-			'Button1': button1_state,
-			'Button2': button2_state,
-			'Button3': button3_state}
-				
-    client.publish(sensor_topic_head + "/state", json.dumps(data))
-    pprint.pprint(data)
-    print('Published. Sleeping ... ')
-	
+	if entity_category:
+		dict["entity_category"] = entity_category
+
+	config_payload = json.dumps(dict)
+	client.publish(config_topic, config_payload, qos=0, retain=True)
+	client.subscribe(device_id + "/" + topic, qos=0)
+
+def __button_pressed(topic, payload):
+	client.publish(topic,payload);
+	print(topic + '=' + payload +' published. Sleeping ... ')
+
 client = mqtt.Client()
 client.on_connect = on_connect
+client.on_message = on_message
 client.connect(config['mqtt'].get('hostname', 'homeassistant'),
                config['mqtt'].getint('port', 1883),
                config['mqtt'].getint('timeout', 60))
 client.loop_start()
 
-while True:
+dhtDevice = adafruit_dht.DHT22(board.D25)
 
-    __send_state()
+while True:
+    temperature = dhtDevice.temperature
+    humidity = dhtDevice.humidity
+	
+    if humidity is not None and temperature is not None:
+        data = {
+		'Temperature': round(temperature, decim_digits),
+			'Humidity': round(humidity, decim_digits)
+		}
+        
+    client.publish(sensor_topic_head + "/state", json.dumps(data))
+    pprint.pprint(data)
+    print('Published. Sleeping ... ')
 
     time.sleep(sleep_time)
-
-
-GPIO.cleanup() # Clean up
